@@ -1,86 +1,59 @@
-from pytube import YouTube, exceptions as pytube_exceptions # Import specific exceptions
-import os
-import pytube # To print version
+from pytube import YouTube
+from pytube.exceptions import PytubeError # For more specific pytube errors
+import pytube # To print the version
 
-def download_youtube_audio(video_url, output_path=".", file_name=None):
+def test_youtube_connection(video_url):
     """
-    Downloads the audio from a YouTube video.
-
-    Args:
-        video_url (str): The URL of the YouTube video.
-        output_path (str): The directory where the audio will be saved. Defaults to current directory.
-        file_name (str, optional): The desired file name (without extension). 
-                                   If None, uses video title.
-
-    Returns:
-        str: The full path to the downloaded audio file, or None if download failed.
+    Tests if pytube can fetch basic metadata (like the title) for a given YouTube URL.
     """
+    print(f"--- Using pytube version: {pytube.__version__} ---")
+    print(f"Attempting to connect and fetch metadata for URL: {video_url}")
+    
     try:
-        print(f"--- Using pytube version: {pytube.__version__} ---") # Print version
-        print(f"Attempting to connect to YouTube with URL: {video_url}...")
+        # Initialize YouTube object.
+        # use_oauth=False and allow_oauth_cache=False are good defaults for public videos.
+        yt = YouTube(video_url, use_oauth=False, allow_oauth_cache=False)
         
-        # Initialize YouTube object
-        yt = YouTube(video_url)
+        # If the above line didn't raise an error, pytube made a successful initial connection.
+        # Now, try to access the title. This forces pytube to fetch video metadata.
+        video_title = yt.title
         
-        print(f"Successfully connected. Video title: '{yt.title}'")
-        print(f"Video author: {yt.author}")
-        print(f"Video length: {yt.length} seconds")
-        # print(f"Available streams: {yt.streams}") # Potentially very long output
-
-        # Filter for audio-only streams and get the first one
-        stream = yt.streams.filter(only_audio=True).first()
-
-        if not stream:
-            print("No suitable audio-only stream found.")
-            return None
-
-        print(f"Found audio stream: {stream}")
-
-        filename_for_pytube = None
-        if file_name:
-            filename_for_pytube, _ = os.path.splitext(file_name)
+        print(f"SUCCESS: Successfully fetched metadata!")
+        print(f"Video Title: '{video_title}'")
+        print(f"Video Author: {yt.author}")
+        print("Pytube seems to be able to connect and get info for this URL.")
+        return True
         
-        print(f"Starting download of audio for '{yt.title}'...")
-        downloaded_file_path = stream.download(output_path=output_path, filename=filename_for_pytube)
-        
-        print(f"Download complete! Audio saved to: {downloaded_file_path}")
-        return downloaded_file_path
-
-    except pytube_exceptions.VideoUnavailable:
-        print(f"Pytube Error: The video {video_url} is unavailable.")
-        return None
-    except pytube_exceptions.RegexMatchError:
-        print(f"Pytube Error: Could not find a match for video ID in URL: {video_url}. Is the URL correct?")
-        return None
-    except pytube_exceptions.PytubeError as pe: # Catch other Pytube specific errors
-        print(f"A Pytube specific error occurred: {pe}")
-        return None
-    except Exception as e: # Catch any other general errors
-        print(f"An unexpected general error occurred: {e}")
-        print(f"Error type: {type(e)}")
-        return None
+    except PytubeError as pe:
+        print(f"PYTUBE ERROR: A Pytube-specific error occurred: {pe}")
+    except Exception as e:
+        # This will catch errors like the HTTPError 400 if it happens during metadata fetch
+        print(f"UNEXPECTED ERROR: An unexpected error occurred: {e}")
+        print(f"Error Type: {type(e)}")
+    
+    print(f"FAILURE: Could not get metadata for URL: {video_url}")
+    return False
 
 if __name__ == "__main__":
-    # Let's try a different standard test video URL: "Big Buck Bunny"
-    # This is a very common, openly licensed video used for testing.
-    sample_video_url = "https://www.youtube.com/watch?v=AdUZArA-kZw&t=0s" 
+    print("--- YouTube Connection Test Script ---")
     
-    print("--- YouTube Audio Downloader (Debug Mode) ---")
+    # Let's use the "Big Buck Bunny" URL that was problematic before.
+    # This is a standard, openly licensed video often used for testing.
+    test_url_1 = "https://www.youtube.com/watch?v=AdUZArA-kZw&t=0s" 
     
-    video_to_download = sample_video_url
-    # You can also uncomment the line below to ask for user input for the URL
-    # video_to_download = input("Enter the YouTube video URL: ")
+    # You can also try a different, very popular, and non-region-restricted video URL.
+    # For example, find a popular music video or a major news channel clip on YouTube
+    # and paste its full URL here:
+    # test_url_2 = "PASTE_A_DIFFERENT_YOUTUBE_URL_HERE"
 
-    save_path = "downloaded_audio"
+    print(f"\nTesting URL 1: {test_url_1}")
+    test_youtube_connection(test_url_1)
     
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-        print(f"Created directory: {save_path}")
+    # if 'test_url_2' in locals() and test_url_2 != "PASTE_A_DIFFERENT_YOUTUBE_URL_HERE":
+    # print(f"\nTesting URL 2: {test_url_2}")
+    # test_youtube_connection(test_url_2)
 
-    downloaded_file = download_youtube_audio(video_to_download, output_path=save_path)
-
-    if downloaded_file:
-        print(f"\nSuccessfully downloaded audio to: {downloaded_file}")
-    else:
-        print(f"\nFailed to download audio for URL: {video_to_download}")
-
+    print("\n--- Test Complete ---")
+    print("If all tests show 'UNEXPECTED ERROR: ... HTTP Error 400 ...',")
+    print("it's likely that pytube is currently unable to communicate effectively with YouTube,")
+    print("possibly due to recent changes on YouTube's side or network/IP related issues.")
