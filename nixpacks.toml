@@ -1,0 +1,8 @@
+# nixpacks.toml
+
+# Specify system packages to install
+[phases.setup]
+aptPkgs = ["ffmpeg"] # For Debian-based environments, which Nixpacks often uses
+
+# If you knew Nix, you could also specify Nix packages directly:
+# nixPkgs = ["ffmpeg"]
