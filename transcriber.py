@@ -1,56 +1,53 @@
-print("--- DEBUG: transcriber.py execution - TOP ---") # First debug line
+print("--- DEBUG: transcriber.py execution - TOP ---")
 
 import yt_dlp
 import os
 import shutil
-from flask import Flask, request, jsonify
-import logging # Keep the import, just comment out basicConfig
+from flask import Flask, request, jsonify, send_from_directory, url_for # Added send_from_directory, url_for
+import logging
 
 print("--- DEBUG: transcriber.py - Imports complete ---")
 
 # --- Flask App Setup ---
 print("--- DEBUG: transcriber.py - About to define Flask app ---")
 app = Flask(__name__)
-print(f"--- DEBUG: transcriber.py - Flask app defined: {app} ---") # Crucial debug line
+print(f"--- DEBUG: transcriber.py - Flask app defined: {app} ---")
 
 # --- Logging Setup ---
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # THIS LINE IS COMMENTED OUT
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s') # Commented out for Gunicorn
 print("--- DEBUG: transcriber.py - Logging basicConfig SKIPPED ---")
 
 # --- Configuration ---
+# DOWNLOADS_BASE_DIR is the absolute path on the server
 DOWNLOADS_BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_downloads")
 if not os.path.exists(DOWNLOADS_BASE_DIR):
     os.makedirs(DOWNLOADS_BASE_DIR)
-    # Use standard print for now if basicConfig is out, or app.logger once app is running
-    print(f"INFO: Created base downloads directory: {DOWNLOADS_BASE_DIR}") 
+    print(f"INFO: Created base downloads directory: {DOWNLOADS_BASE_DIR}")
 print("--- DEBUG: transcriber.py - DOWNLOADS_BASE_DIR configured ---")
 
 
 def is_ffmpeg_available():
-    """Checks if ffmpeg is installed and accessible."""
     return shutil.which("ffmpeg") is not None
 
 def process_video_with_ytdlp(video_url, download_transcript=False, audio_format="mp3"):
-    """
-    Downloads audio and optionally transcripts from a video URL using yt-dlp.
-    """
-    # Use app.logger if app context is available, otherwise standard logging/print
-    # For now, using standard logging which will be configured by Gunicorn or Flask's default
-    current_logger = logging.getLogger(__name__) # Get a logger instance
+    current_logger = logging.getLogger(__name__)
 
     if not is_ffmpeg_available() and (audio_format != 'best' or download_transcript):
         error_msg = "FFmpeg is not installed or not found. It's required for audio conversion and transcript processing."
         current_logger.error(error_msg)
-        return {"error": error_msg, "audio_path": None, "transcript_path": None}
+        return {"error": error_msg, "audio_server_path": None, "transcript_server_path": None, "audio_relative_path": None, "transcript_relative_path": None}
 
-    downloaded_files = {"audio_path": None, "transcript_path": None, "error": None}
+    # Initialize paths as None
+    downloaded_files = {
+        "audio_server_path": None, 
+        "transcript_server_path": None, 
+        "audio_relative_path": None, # Path relative to DOWNLOADS_BASE_DIR
+        "transcript_relative_path": None, # Path relative to DOWNLOADS_BASE_DIR
+        "error": None
+    }
 
     try:
-        info_opts = {
-            'quiet': True,
-            'noplaylist': True,
-            'extract_flat': 'in_playlist',
-        }
+        info_opts = {'quiet': True, 'noplaylist': True, 'extract_flat': 'in_playlist'}
         with yt_dlp.YoutubeDL(info_opts) as ydl_info:
             current_logger.info(f"Fetching video metadata for URL: {video_url}...")
             try:
@@ -65,36 +62,33 @@ def process_video_with_ytdlp(video_url, download_transcript=False, audio_format=
                 downloaded_files["error"] = f"Failed to extract video info: {str(e)}"
                 return downloaded_files
 
-        base_output_filename = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in video_title).rstrip()
-        base_output_filename = base_output_filename[:80]
+        base_output_filename_safe = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in video_title).rstrip()
+        base_output_filename_safe = base_output_filename_safe[:80]
         
-        request_download_dir = os.path.join(DOWNLOADS_BASE_DIR, base_output_filename)
-        if not os.path.exists(request_download_dir):
-            os.makedirs(request_download_dir)
-            current_logger.info(f"Created request-specific download directory: {request_download_dir}")
+        # This is the folder name relative to DOWNLOADS_BASE_DIR
+        request_folder_name = base_output_filename_safe 
+        request_download_dir_abs = os.path.join(DOWNLOADS_BASE_DIR, request_folder_name)
 
-        output_template_audio = os.path.join(request_download_dir, f'{base_output_filename}.%(ext)s')
-        output_template_transcript = os.path.join(request_download_dir, f'{base_output_filename}.%(ext)s')
+        if not os.path.exists(request_download_dir_abs):
+            os.makedirs(request_download_dir_abs)
+            current_logger.info(f"Created request-specific download directory: {request_download_dir_abs}")
+
+        # yt-dlp needs absolute path for outtmpl
+        output_template_audio_abs = os.path.join(request_download_dir_abs, f'{base_output_filename_safe}.%(ext)s')
+        output_template_transcript_abs = os.path.join(request_download_dir_abs, f'{base_output_filename_safe}.%(ext)s')
 
         ydl_opts = {
             'format': 'bestaudio/best',
-            'outtmpl': output_template_audio,
+            'outtmpl': output_template_audio_abs,
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format}],
-            'noplaylist': True,
-            'quiet': False, # Let yt-dlp print its progress
-            'noprogress': False, # Show progress
-            'verbose': False, # Keep this false unless deep debugging yt-dlp
-            # Using 'logger': current_logger can direct yt-dlp logs to Flask/Gunicorn logger
-            'logger': current_logger,
+            'noplaylist': True, 'quiet': False, 'noprogress': False, 'verbose': False, 'logger': current_logger,
         }
 
         if download_transcript:
             ydl_opts.update({
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': ['en', 'ro', 'all'], # Prioritize English, Romanian
-                'subtitlesformat': 'vtt', # vtt is good for text, srt is also common
-                'outtmpl': output_template_transcript, # yt-dlp handles naming for subs
+                'writesubtitles': True, 'writeautomaticsub': True,
+                'subtitleslangs': ['en', 'ro', 'all'], 'subtitlesformat': 'vtt',
+                'outtmpl': output_template_transcript_abs, # yt-dlp uses this for subs too
             })
         
         current_logger.info(f"Preparing to download. Options: {ydl_opts}")
@@ -108,28 +102,35 @@ def process_video_with_ytdlp(video_url, download_transcript=False, audio_format=
                 downloaded_files["error"] = error_msg
                 return downloaded_files
 
-        downloaded_files["audio_path"] = os.path.join(request_download_dir, f"{base_output_filename}.{audio_format}")
+        # Store absolute server path
+        downloaded_files["audio_server_path"] = os.path.join(request_download_dir_abs, f"{base_output_filename_safe}.{audio_format}")
+        # Store relative path for URL generation
+        downloaded_files["audio_relative_path"] = os.path.join(request_folder_name, f"{base_output_filename_safe}.{audio_format}")
         
         if download_transcript:
-            transcript_file_found = None
-            # Scan for the transcript file, yt-dlp might add language code
-            for f_name in os.listdir(request_download_dir):
-                if f_name.startswith(base_output_filename) and f_name.endswith((".vtt", ".srt")): # Check for common subtitle extensions
-                    transcript_file_found = os.path.join(request_download_dir, f_name)
-                    break # Take the first one found
-            if transcript_file_found and os.path.exists(transcript_file_found):
-                downloaded_files["transcript_path"] = transcript_file_found
-                current_logger.info(f"Transcript found: {transcript_file_found}")
+            transcript_file_found_abs = None
+            transcript_file_found_relative = None
+            for f_name in os.listdir(request_download_dir_abs):
+                if f_name.startswith(base_output_filename_safe) and f_name.endswith((".vtt", ".srt")):
+                    transcript_file_found_abs = os.path.join(request_download_dir_abs, f_name)
+                    transcript_file_found_relative = os.path.join(request_folder_name, f_name)
+                    break
+            if transcript_file_found_abs and os.path.exists(transcript_file_found_abs):
+                downloaded_files["transcript_server_path"] = transcript_file_found_abs
+                downloaded_files["transcript_relative_path"] = transcript_file_found_relative
+                current_logger.info(f"Transcript found: {transcript_file_found_abs}")
             else:
-                current_logger.warning(f"Transcript download was requested, but no VTT/SRT file found starting with '{base_output_filename}' in {request_download_dir}.")
-                downloaded_files["transcript_path"] = "Transcript not found or not available."
+                current_logger.warning(f"Transcript requested, but no VTT/SRT file found in {request_download_dir_abs}.")
+                # No error, just transcript not found
+        
+        if not os.path.exists(downloaded_files["audio_server_path"]):
+            current_logger.error(f"Audio file not found at expected path: {downloaded_files['audio_server_path']}")
+            downloaded_files["error"] = "Audio file processing failed or file not found post-download."
+            downloaded_files["audio_server_path"] = None
+            downloaded_files["audio_relative_path"] = None
 
-        if not os.path.exists(downloaded_files["audio_path"]):
-            current_logger.error(f"Audio file not found at expected path: {downloaded_files['audio_path']}")
-            downloaded_files["error"] = "Audio file processing failed or file not found."
-            downloaded_files["audio_path"] = None
 
-        current_logger.info(f"Process complete. Results: {downloaded_files}")
+        current_logger.info(f"Process complete. Results (server paths): {downloaded_files}")
         return downloaded_files
 
     except yt_dlp.utils.DownloadError as de:
@@ -141,50 +142,66 @@ def process_video_with_ytdlp(video_url, download_transcript=False, audio_format=
         downloaded_files["error"] = f"Unexpected error: {str(e)}"
         return downloaded_files
 
+# --- New Route to Serve Downloaded Files ---
+@app.route('/files/<path:relative_file_path>')
+def serve_downloaded_file(relative_file_path):
+    app.logger.info(f"Request to serve file: {relative_file_path} from base: {DOWNLOADS_BASE_DIR}")
+    # relative_file_path will be like "Video_Title_Safe_Folder/Video_Title_Safe_File.mp3"
+    try:
+        return send_from_directory(DOWNLOADS_BASE_DIR, relative_file_path, as_attachment=True)
+    except FileNotFoundError:
+        app.logger.error(f"File not found for serving: {relative_file_path}")
+        return jsonify({"error": "File not found or path is incorrect"}), 404
+    except Exception as e:
+        app.logger.error(f"Error serving file {relative_file_path}: {e}")
+        return jsonify({"error": "Could not serve file"}), 500
+
+
 # --- API Endpoint ---
 @app.route('/api/process_video', methods=['GET'])
 def api_process_video():
-    # Use app.logger here as we are in a Flask context
     app.logger.info("Received request for /api/process_video") 
-    video_url = request.args.get('url')
+    video_url_param = request.args.get('url') # Renamed to avoid clash with flask.url_for
     get_transcript_str = request.args.get('get_transcript', 'false').lower()
 
-    if not video_url:
+    if not video_url_param:
         app.logger.warning("Missing 'url' parameter in request.")
         return jsonify({"error": "Missing 'url' parameter"}), 400
 
     download_transcript_bool = get_transcript_str == 'true'
     
-    app.logger.info(f"Processing URL: {video_url}, Download transcript: {download_transcript_bool}")
+    app.logger.info(f"Processing URL: {video_url_param}, Download transcript: {download_transcript_bool}")
     
-    result = process_video_with_ytdlp(video_url, download_transcript=download_transcript_bool)
+    result = process_video_with_ytdlp(video_url_param, download_transcript=download_transcript_bool)
 
-    if result.get("error"):
-        return jsonify(result), 500
+    response_data = {
+        "audio_download_url": None,
+        "transcript_download_url": None,
+        "audio_server_path": result.get("audio_server_path"), # Keep server path for debugging/internal use
+        "transcript_server_path": result.get("transcript_server_path"),
+        "error": result.get("error")
+    }
+
+    if result.get("audio_relative_path"):
+        # _external=True generates an absolute URL like https://your-app.up.railway.app/...
+        response_data["audio_download_url"] = url_for('serve_downloaded_file', relative_file_path=result["audio_relative_path"], _external=True)
+    
+    if result.get("transcript_relative_path"):
+        response_data["transcript_download_url"] = url_for('serve_downloaded_file', relative_file_path=result["transcript_relative_path"], _external=True)
+
+    if response_data.get("error"):
+        return jsonify(response_data), 500
     else:
-        return jsonify(result), 200
+        return jsonify(response_data), 200
 
-# --- Main execution (for local testing, Gunicorn won't run this block) ---
+# --- Main execution (for local testing) ---
 if __name__ == '__main__':
     print("--- DEBUG: transcriber.py - In __main__ block (for local run) ---") 
-    # When running with Gunicorn, Gunicorn handles logging setup.
-    # For local `python transcriber.py` execution, we might want basicConfig.
-    # However, since Gunicorn is the target, let's keep it commented out
-    # to ensure consistency with the production environment's loading.
-    # If you need to test logging locally, you can temporarily uncomment it.
-    # logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(module)s - %(message)s')
-
-
     if not is_ffmpeg_available():
-        # Use app.logger if available, otherwise print or standard logging
-        print("CRITICAL: FFmpeg is not installed or not found. This API requires FFmpeg for its core functionality.")
-        print("Please install FFmpeg and ensure it's in your system's PATH.")
+        print("CRITICAL: FFmpeg is not installed or not found.")
     else:
         print("FFmpeg found (local check).")
-
     print(f"Downloads (local run) will be saved in subdirectories under: {DOWNLOADS_BASE_DIR}")
-    # The app.run() below is only for local development and won't be used by Gunicorn.
-    # Gunicorn uses the 'app' instance directly.
-    app.run(host='0.0.0.0', port=5001, debug=True) # debug=True provides more Flask output
+    app.run(host='0.0.0.0', port=5001, debug=True)
 
-print("--- DEBUG: transcriber.py execution - BOTTOM ---") # Last debug line
+print("--- DEBUG: transcriber.py execution - BOTTOM ---")
