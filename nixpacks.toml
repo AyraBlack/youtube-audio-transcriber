@@ -2,7 +2,8 @@
 
 # Specify system packages to install
 [phases.setup]
-aptPkgs = ["ffmpeg"] # For Debian-based environments, which Nixpacks often uses
+aptPkgs = ["ffmpeg"]
 
-# If you knew Nix, you could also specify Nix packages directly:
-# nixPkgs = ["ffmpeg"]
+# Define the command to start the application
+[phases.start]
+startCmd = "gunicorn --bind 0.0.0.0:$PORT transcriber:app"
