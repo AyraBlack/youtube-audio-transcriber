@@ -1,130 +1,171 @@
-import yt_dlp # Import the yt-dlp library
+print("--- DEBUG: transcriber.py execution - TOP ---") # First debug line
+
+import yt_dlp
 import os
-import shutil # For checking if ffmpeg is available
+import shutil
+from flask import Flask, request, jsonify
+import logging
+
+print("--- DEBUG: transcriber.py - Imports complete ---")
+
+# --- Flask App Setup ---
+print("--- DEBUG: transcriber.py - About to define Flask app ---")
+app = Flask(__name__)
+print(f"--- DEBUG: transcriber.py - Flask app defined: {app} ---") # Crucial debug line
+
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+print("--- DEBUG: transcriber.py - Logging configured ---")
+
+# --- Configuration ---
+DOWNLOADS_BASE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "api_downloads")
+if not os.path.exists(DOWNLOADS_BASE_DIR):
+    os.makedirs(DOWNLOADS_BASE_DIR)
+    logging.info(f"Created base downloads directory: {DOWNLOADS_BASE_DIR}")
+print("--- DEBUG: transcriber.py - DOWNLOADS_BASE_DIR configured ---")
+
 
 def is_ffmpeg_available():
     """Checks if ffmpeg is installed and accessible."""
     return shutil.which("ffmpeg") is not None
 
-def download_youtube_audio_ytdlp(video_url, output_path=".", file_name=None, audio_format="mp3"):
+def process_video_with_ytdlp(video_url, download_transcript=False, audio_format="mp3"):
     """
-    Downloads the audio from a YouTube video using yt-dlp.
-
-    Args:
-        video_url (str): The URL of the YouTube video.
-        output_path (str): The directory where the audio will be saved.
-        file_name (str, optional): The desired file name (without extension). 
-                                   If None, uses a sanitized video title.
-        audio_format (str): The desired audio format (e.g., "mp3", "wav", "m4a").
-
-    Returns:
-        str: The full path to the downloaded audio file, or None if download failed.
+    Downloads audio and optionally transcripts from a video URL using yt-dlp.
+    (Rest of the function remains the same as before)
     """
-    if not is_ffmpeg_available():
-        print("--------------------------------------------------------------------")
-        print("ERROR: FFmpeg is not installed or not found in your system's PATH.")
-        print("yt-dlp requires FFmpeg to extract and convert audio.")
-        print("Please install FFmpeg. On macOS, you can use Homebrew: 'brew install ffmpeg'")
-        print("--------------------------------------------------------------------")
-        return None
+    if not is_ffmpeg_available() and (audio_format != 'best' or download_transcript):
+        error_msg = "FFmpeg is not installed or not found. It's required for audio conversion and transcript processing."
+        logging.error(error_msg)
+        return {"error": error_msg, "audio_path": None, "transcript_path": None}
+
+    downloaded_files = {"audio_path": None, "transcript_path": None, "error": None}
 
     try:
-        # --- 1. Get video info (like title) first to determine filename if not provided ---
         info_opts = {
             'quiet': True,
             'noplaylist': True,
+            'extract_flat': 'in_playlist',
         }
         with yt_dlp.YoutubeDL(info_opts) as ydl_info:
-            print(f"Fetching video metadata for URL: {video_url}...")
-            info_dict = ydl_info.extract_info(video_url, download=False)
-            video_title = info_dict.get('title', 'unknown_video')
-            print(f"Video title: '{video_title}'")
+            logging.info(f"Fetching video metadata for URL: {video_url}...")
+            try:
+                info_dict = ydl_info.extract_info(video_url, download=False)
+                if '_type' in info_dict and info_dict['_type'] == 'playlist':
+                    video_title = info_dict.get('entries', [{}])[0].get('title', 'unknown_video_in_playlist')
+                else:
+                    video_title = info_dict.get('title', 'unknown_video')
+                logging.info(f"Video title: '{video_title}'")
+            except yt_dlp.utils.DownloadError as e:
+                logging.error(f"Failed to extract video info: {e}")
+                downloaded_files["error"] = f"Failed to extract video info: {str(e)}"
+                return downloaded_files
 
-        # --- 2. Determine the base output filename (without extension) ---
-        if file_name:
-            base_output_filename = os.path.splitext(file_name)[0] # Use user-provided name, remove extension if any
-        else:
-            # Use a sanitized version of the video title
-            base_output_filename = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in video_title).rstrip()
-            base_output_filename = base_output_filename[:100] # Limit length for sanity
-
-        # --- 3. Configure yt-dlp options for audio download and conversion ---
-        # The output template will now use our determined base_output_filename
-        output_template = os.path.join(output_path, f'{base_output_filename}.%(ext)s')
+        base_output_filename = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in video_title).rstrip()
+        base_output_filename = base_output_filename[:80]
         
+        request_download_dir = os.path.join(DOWNLOADS_BASE_DIR, base_output_filename)
+        if not os.path.exists(request_download_dir):
+            os.makedirs(request_download_dir)
+            logging.info(f"Created request-specific download directory: {request_download_dir}")
+
+        output_template_audio = os.path.join(request_download_dir, f'{base_output_filename}.%(ext)s')
+        output_template_transcript = os.path.join(request_download_dir, f'{base_output_filename}.%(ext)s')
+
         ydl_opts = {
-            'format': 'bestaudio/best',  # Choose best audio quality
-            'outtmpl': output_template,   # Output template using our base name
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': audio_format, # e.g., 'mp3', 'wav'
-                # 'preferredquality': '192', # For mp3, quality in kbit/s. Optional.
-            }],
-            'noplaylist': True,         # Only download single video if playlist URL is given
-            'quiet': False,             # Show yt-dlp's own progress messages
-            'progress_hooks': [lambda d: print(d.get('_percent_str', ''), d.get('_speed_str', ''), d.get('_eta_str', ''), end='\r') if d['status'] == 'downloading' else None],
+            'format': 'bestaudio/best',
+            'outtmpl': output_template_audio,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format}],
+            'noplaylist': True,
+            'quiet': False,
+            'noprogress': True,
+            'verbose': False,
         }
 
-        print(f"Preparing to download audio as '{base_output_filename}.{audio_format}' to '{output_path}'...")
+        if download_transcript:
+            ydl_opts.update({
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['en', 'ro', 'all'],
+                'subtitlesformat': 'vtt',
+                'outtmpl': output_template_transcript,
+            })
+        
+        logging.info(f"Preparing to download. Options: {ydl_opts}")
 
-        # --- 4. Perform the download ---
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            error_code = ydl.download([video_url]) # Pass URL as a list
-
+            logging.info(f"Starting download process for {video_url}...")
+            error_code = ydl.download([video_url])
             if error_code != 0:
-                print(f"\nAn error occurred during download (yt-dlp error code: {error_code}).")
-                return None
+                error_msg = f"yt-dlp download process failed with error code {error_code}."
+                logging.error(error_msg)
+                downloaded_files["error"] = error_msg
+                return downloaded_files
 
-        # --- 5. Determine the final downloaded file path ---
-        # yt-dlp will have created the file with the correct extension (e.g., .mp3)
-        final_downloaded_path = os.path.join(output_path, f"{base_output_filename}.{audio_format}")
+        downloaded_files["audio_path"] = os.path.join(request_download_dir, f"{base_output_filename}.{audio_format}")
+        
+        if download_transcript:
+            transcript_file_found = None
+            for f_name in os.listdir(request_download_dir):
+                if f_name.endswith(".vtt"):
+                    transcript_file_found = os.path.join(request_download_dir, f_name)
+                    break
+            if transcript_file_found and os.path.exists(transcript_file_found):
+                downloaded_files["transcript_path"] = transcript_file_found
+                logging.info(f"Transcript found: {transcript_file_found}")
+            else:
+                logging.warning(f"Transcript download was requested, but no VTT file found in {request_download_dir}.")
+                downloaded_files["transcript_path"] = "Transcript not found or not available."
 
-        if os.path.exists(final_downloaded_path):
-            print(f"\nDownload and conversion complete! Audio saved to: {final_downloaded_path}")
-            return final_downloaded_path
-        else:
-            print(f"\nDownload seemed to complete, but the expected file was not found: {final_downloaded_path}")
-            print("This might be due to an issue with FFmpeg or yt-dlp's post-processing.")
-            return None
+        if not os.path.exists(downloaded_files["audio_path"]):
+            logging.error(f"Audio file not found at expected path: {downloaded_files['audio_path']}")
+            downloaded_files["error"] = "Audio file processing failed or file not found."
+            downloaded_files["audio_path"] = None
+
+        logging.info(f"Process complete. Results: {downloaded_files}")
+        return downloaded_files
 
     except yt_dlp.utils.DownloadError as de:
-        print(f"\nyt-dlp DownloadError: {de}")
-        return None
+        logging.error(f"yt-dlp DownloadError: {de}")
+        downloaded_files["error"] = f"yt-dlp DownloadError: {str(de)}"
+        return downloaded_files
     except Exception as e:
-        print(f"\nAn unexpected general error occurred: {e}")
-        print(f"Error type: {type(e)}")
-        return None
+        logging.error(f"Unexpected general error in process_video_with_ytdlp: {e}", exc_info=True)
+        downloaded_files["error"] = f"Unexpected error: {str(e)}"
+        return downloaded_files
 
-if __name__ == "__main__":
-    print("--- YouTube Audio Downloader (using yt-dlp) ---")
+# --- API Endpoint ---
+@app.route('/api/process_video', methods=['GET'])
+def api_process_video():
+    logging.info("Received request for /api/process_video")
+    video_url = request.args.get('url')
+    get_transcript_str = request.args.get('get_transcript', 'false').lower()
 
-    # Ensure FFmpeg is installed before proceeding
-    if not is_ffmpeg_available():
-        print("\nPlease install FFmpeg and try again.")
+    if not video_url:
+        logging.warning("Missing 'url' parameter in request.")
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+
+    download_transcript_bool = get_transcript_str == 'true'
+    
+    logging.info(f"Processing URL: {video_url}, Download transcript: {download_transcript_bool}")
+    
+    result = process_video_with_ytdlp(video_url, download_transcript=download_transcript_bool)
+
+    if result.get("error"):
+        return jsonify(result), 500
     else:
-        print("FFmpeg found. Proceeding with download attempt...")
-        # A known working, non-region-restricted video URL
-        sample_video_url = "https://www.youtube.com/watch?v=AdUZArA-kZw&t=0s" # Big Buck Bunny
-        # You can also use the Rick Astley video if you prefer:
-        # sample_video_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        return jsonify(result), 200
 
-        # video_to_download = input("Enter the YouTube video URL: ")
-        video_to_download = sample_video_url 
+# --- Main execution ---
+if __name__ == '__main__':
+    print("--- DEBUG: transcriber.py - In __main__ block ---") # Debug for local run
+    if not is_ffmpeg_available():
+        logging.error("CRITICAL: FFmpeg is not installed or not found. This API requires FFmpeg for its core functionality.")
+        logging.error("Please install FFmpeg and ensure it's in your system's PATH.")
+    else:
+        logging.info("FFmpeg found.")
 
-        save_path = "downloaded_audio_ytdlp" # New folder to avoid confusion
-        desired_audio_format = "mp3" # Can be "wav", "m4a", etc.
-        # custom_filename_base = "my_custom_audio_name" # Optional: if you want a specific name
+    logging.info(f"Downloads will be saved in subdirectories under: {DOWNLOADS_BASE_DIR}")
+    app.run(host='0.0.0.0', port=5001, debug=True)
 
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-            print(f"Created directory: {save_path}")
-
-        print(f"\nAttempting to download: {video_to_download}")
-        # downloaded_file = download_youtube_audio_ytdlp(video_to_download, output_path=save_path, file_name=custom_filename_base, audio_format=desired_audio_format)
-        downloaded_file = download_youtube_audio_ytdlp(video_to_download, output_path=save_path, audio_format=desired_audio_format)
-
-
-        if downloaded_file:
-            print(f"\nSUCCESS: Audio downloaded to: {downloaded_file}")
-        else:
-            print(f"\nFAILURE: Could not download audio for URL: {video_to_download}")
+print("--- DEBUG: transcriber.py execution - BOTTOM ---") # Last debug line
