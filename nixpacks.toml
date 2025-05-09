@@ -3,7 +3,3 @@
 # Specify system packages to install
 [phases.setup]
 aptPkgs = ["ffmpeg"]
-
-# Define the command to start the application
-[phases.start]
-startCmd = "gunicorn --bind 0.0.0.0:$PORT transcriber:app"
