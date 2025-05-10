@@ -57,7 +57,6 @@ def vtt_to_plaintext(vtt_content):
             # Remove VTT tags like <v Speaker Name> or alignment tags
             cleaned_line = re.sub(r'<[^>]+>', '', line_stripped)
             # Basic HTML entity handling that might appear in VTT
-            # Using .replace('&', '&') is redundant, fixed others.
             cleaned_line = cleaned_line.replace('&', '&').replace('<', '<').replace('>', '>')
             if cleaned_line: # Add non-empty lines
                  text_lines.append(cleaned_line)
@@ -127,7 +126,8 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
         result_paths["error"] = f"Unexpected error during audio extraction: {str(e)}"
         return result_paths
 
-# --- START OF NEW FUNCTION TO ADD ---
+# --- START OF FUNCTION THAT WAS ALREADY IN YOUR PROVIDED SCRIPT ---
+# (This is the one we worked on to get title, channel, transcript, language for YouTube)
 def get_youtube_details_and_transcript(video_url):
     app.logger.info(f"Details and transcript requested for YouTube URL: {video_url}")
     result_data = {
@@ -176,7 +176,6 @@ def get_youtube_details_and_transcript(video_url):
                         if sub_info.get('filepath') and os.path.exists(sub_info['filepath']):
                             downloaded_vtt_path = sub_info['filepath']
                         else: 
-                            # Construct potential path based on outtmpl and lang code
                             potential_path = f"{output_template_transcript_abs}.{lang_code_iter}.vtt"
                             if os.path.exists(potential_path):
                                 downloaded_vtt_path = potential_path
@@ -189,8 +188,6 @@ def get_youtube_details_and_transcript(video_url):
             if not downloaded_vtt_path: 
                 app.logger.info("Transcript path not directly in 'requested_subtitles', scanning directory for VTT files...")
                 for lang_scan in ['ro', 'en']: 
-                    # Corrected path construction for scanning: use temp_vtt_basename directly
-                    # yt-dlp often names the file like <outtmpl>.<lang>.vtt
                     potential_path = os.path.join(TRANSCRIPTS_TEMP_DIR, f"{temp_vtt_basename}.{lang_scan}.vtt")
                     if os.path.exists(potential_path):
                         downloaded_vtt_path = potential_path
@@ -201,7 +198,6 @@ def get_youtube_details_and_transcript(video_url):
             if not downloaded_vtt_path:
                 result_data["error"] = "Transcript VTT file not found after download attempt or not available in RO/EN."
                 app.logger.warning(result_data["error"])
-                # Return early if no transcript, but title/channel might be populated if fetched successfully before this point
                 return result_data 
 
             with open(downloaded_vtt_path, 'r', encoding='utf-8') as f:
@@ -215,10 +211,8 @@ def get_youtube_details_and_transcript(video_url):
         app.logger.error(f"yt-dlp DownloadError during YouTube processing for {video_url}: {error_message}")
         if "no subtitles found" in error_message.lower() or "subtitles not available" in error_message.lower():
             result_data["error"] = "No subtitles available for the requested languages (RO/EN)."
-            # Attempt to get metadata even if subtitles fail, if not already fetched
-            if not result_data["title"]: # Only if title wasn't fetched with subs attempt
+            if not result_data["title"]: 
                 try:
-                    # Use a simpler ydl_opts for metadata only if the subtitle-focused one failed early
                     with yt_dlp.YoutubeDL({'quiet': True, 'noplaylist': True, 'skip_download': True, 'logger': app.logger, 'socket_timeout': SOCKET_TIMEOUT_SECONDS}) as ydl_meta:
                         info_dict_meta = ydl_meta.extract_info(video_url, download=False)
                         result_data["title"] = info_dict_meta.get('title', 'Unknown Title')
@@ -239,7 +233,7 @@ def get_youtube_details_and_transcript(video_url):
             except Exception as e_del:
                 app.logger.error(f"Error deleting temporary transcript file {downloaded_vtt_path}: {e_del}")
     return result_data
-# --- END OF NEW FUNCTION TO ADD ---
+# --- END OF FUNCTION THAT WAS ALREADY IN YOUR PROVIDED SCRIPT ---
 
 
 # --- API Endpoints ---
@@ -266,59 +260,59 @@ def api_extract_audio():
              app.logger.warning("url_for executed outside of request context for /api/extract_audio. Constructing URL manually.")
              try:
                  host_url = request.host_url 
-             except RuntimeError: # Still might fail if no request context at all
-                 # Fallback if request.host_url is not available (e.g. if app context not fully pushed)
-                 # You might need to configure this base URL if this fallback is hit often
-                 host_url = "http://localhost:5001" # Default to your local dev port, adjust if deployed elsewhere
+             except RuntimeError: 
+                 host_url = "http://localhost:5001" 
                  app.logger.warning(f"Falling back to host_url: {host_url} for audio_download_url")
              response_data["audio_download_url"] = f"{host_url.rstrip('/')}/files/{result['audio_relative_path']}"
 
     status_code = 200
     if response_data.get("error"):
-        # Only set 500 if essential parts are missing
         if not response_data.get("audio_download_url") and not response_data.get("audio_server_path"):
              status_code = 500
-        # If there's an error but some info (like server path) is there, maybe still 200 or a specific error code
-        # For simplicity, let's make it 500 if any error is reported by the function
         else: 
              status_code = 500 
     return jsonify(response_data), status_code
 
-# --- START OF NEW ROUTE TO ADD ---
+# --- THIS IS THE ROUTE THAT WAS ALREADY IN YOUR SCRIPT, NOW WITH CORRECTED URL CHECK ---
 @app.route('/api/get_youtube_details', methods=['GET'])
-def api_get_youtube_details_route(): # Renamed function for clarity
+def api_get_youtube_details_route(): 
     app.logger.info("Received request for /api/get_youtube_details")
     video_url_param = request.args.get('url')
     if not video_url_param:
         app.logger.warning("Missing 'url' parameter in /api/get_youtube_details request.")
         return jsonify({"error": "Missing 'url' parameter"}), 400
     
-    # Basic check if it's a YouTube URL (can be more robust)
-    # Using generic youtube.com and youtu.be check
-    if not ("https://www.youtube.com/watch?v=xqcl9dAAkC0" in video_url_param.lower() or "https://www.youtube.com/watch?v=tt6_v_LoOZw" in video_url_param.lower()):
+    # --- START OF CORRECTED YOUTUBE URL CHECK ---
+    # More robust check for YouTube URLs
+    is_youtube_url = False
+    if video_url_param: # Ensure video_url_param is not None before calling lower()
+        lower_video_url = video_url_param.lower()
+        if "https://youtube-audio-transcriber-production.up.railway.app/api/get_youtube_details?url=https://www.https://www.youtube.com/watch?v=QkO7WSQbFbo0" in lower_video_url or \
+           "https://www.youtube.com/watch?v=JIU_H7gXy541" in lower_video_url or \
+           "https://www.youtube.com/watch?v=JIU_H7gXy542" in lower_video_url: # For youtu.be links
+            is_youtube_url = True
+    
+    if not is_youtube_url:
         app.logger.warning(f"Non-YouTube URL provided to /api/get_youtube_details: {video_url_param}")
         return jsonify({"error": "Invalid URL; only YouTube URLs are supported by this endpoint."}), 400
+    # --- END OF CORRECTED YOUTUBE URL CHECK ---
         
-    result = get_youtube_details_and_transcript(video_url_param) # Call the new combined function
+    result = get_youtube_details_and_transcript(video_url_param) 
     
-    status_code = 200 # Default to success
+    status_code = 200 
     if result.get("error"):
-        # If there's an error but we still got a title (e.g., transcript failed but metadata worked)
-        # we might still consider it a partial success for returning metadata.
         if result.get("title") and ("No subtitles available" in result.get("error", "") or "Transcript VTT file not found" in result.get("error", "")):
-            status_code = 206 # Partial Content (metadata okay, transcript failed for known reason)
+            status_code = 206 
             app.logger.info(f"Partial success for {video_url_param}: Metadata retrieved, but transcript error: {result.get('error')}")
-        # If there's an error and no title (major failure)
-        elif not result.get("title"):
+        elif not result.get("title"): 
             status_code = 500
             app.logger.error(f"Major failure for {video_url_param}: {result.get('error')}")
-        # Other errors where title might be present but it's not a subtitle issue
-        else:
+        else: 
             status_code = 500 
             app.logger.error(f"Other error for {video_url_param}: {result.get('error')}")
             
     return jsonify(result), status_code
-# --- END OF NEW ROUTE TO ADD ---
+# --- END OF ROUTE THAT WAS ALREADY IN YOUR SCRIPT ---
 
 @app.route('/files/<path:relative_file_path>')
 def serve_downloaded_file(relative_file_path):
@@ -348,4 +342,4 @@ if __name__ == '__main__':
         app.logger.info("FFmpeg found (local check).")
     app.logger.info(f"MP3s will be saved under: {DOWNLOADS_BASE_DIR}")
     app.logger.info(f"Temp transcripts under: {TRANSCRIPTS_TEMP_DIR}")
-    app.run(host='0.0.0.0', port=5001, debug=True) # Assuming port 5001 for local dev based on your earlier mention
+    app.run(host='0.0.0.0', port=5001, debug=True)
