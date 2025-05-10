@@ -5,7 +5,7 @@ import re # For parsing VTT
 from flask import Flask, request, jsonify, send_from_directory, url_for
 import logging
 import uuid # For unique temporary transcript file names
-from datetime import datetime # Added for timestamped filenames
+from datetime import datetime
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -25,14 +25,20 @@ if not os.path.exists(TRANSCRIPTS_TEMP_DIR):
 
 # --- Constants ---
 SOCKET_TIMEOUT_SECONDS = 180
-# Common User-Agent string
 COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+
+# --- Get Proxy from Environment Variable ---
+PROXY_URL_FROM_ENV = os.environ.get('PROXY_URL') # Read from environment
+if PROXY_URL_FROM_ENV:
+    app.logger.info(f"Using proxy URL from environment: {PROXY_URL_FROM_ENV.split('@')[1] if '@' in PROXY_URL_FROM_ENV else 'Proxy configured (details hidden)'}") # Log proxy host, not full creds
+else:
+    app.logger.info("No PROXY_URL environment variable set. Operating without proxy.")
+
 
 def is_ffmpeg_available():
     return shutil.which("ffmpeg") is not None
 
-def sanitize_filename(name_str, max_length=60): # Reduced max_length to accommodate timestamp
-    """Sanitizes a string to be a safe filename component."""
+def sanitize_filename(name_str, max_length=60):
     s = name_str.replace(' ', '_')
     s = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in s)
     s = re.sub(r'_+', '_', s)
@@ -54,11 +60,25 @@ def vtt_to_plaintext(vtt_content):
         if line_stripped.isdigit() and not in_dialogue_block:
             continue
         if in_dialogue_block:
-            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped) # Remove VTT tags like <v Author>Text</v> or <i>Text</i>
-            cleaned_line = cleaned_line.replace(' ', ' ').replace('&', '&').replace('<', '<').replace('>', '>') # Handle common HTML entities
+            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped)
+            cleaned_line = cleaned_line.replace(' ', ' ').replace('&', '&').replace('<', '<').replace('>', '>')
             if cleaned_line:
                 text_lines.append(cleaned_line)
     return "\n".join(text_lines)
+
+def _get_common_ydl_opts():
+    """Helper to get common yt-dlp options including proxy if set."""
+    opts = {
+        'socket_timeout': SOCKET_TIMEOUT_SECONDS,
+        'http_headers': {'User-Agent': COMMON_USER_AGENT},
+        'logger': app.logger,
+        'noplaylist': True,
+        'noprogress': True, # Good for API logs
+        'verbose': False,   # Keep false unless deep debugging yt-dlp
+    }
+    if PROXY_URL_FROM_ENV:
+        opts['proxy'] = PROXY_URL_FROM_ENV
+    return opts
 
 def extract_audio_from_video(video_url, audio_format="mp3"):
     app.logger.info(f"Audio extraction requested for URL: {video_url}")
@@ -69,11 +89,11 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
 
     result_paths = {"audio_server_path": None, "audio_relative_path": None, "error": None}
     try:
-        # Add User-Agent to info_opts
+        common_opts = _get_common_ydl_opts()
         info_opts = {
-            'quiet': True, 'noplaylist': True, 'extract_flat': 'in_playlist',
-            'socket_timeout': SOCKET_TIMEOUT_SECONDS,
-            'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
+            **common_opts, # Spread common options
+            'quiet': True, # Overrides logger for this specific info call if too noisy
+            'extract_flat': 'in_playlist',
         }
         with yt_dlp.YoutubeDL(info_opts) as ydl_info:
             app.logger.info(f"Fetching video metadata for audio: {video_url}...")
@@ -95,16 +115,15 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
         actual_disk_filename_template = f'{base_output_filename_safe}.%(ext)s'
         output_template_audio_abs = os.path.join(request_download_dir_abs, actual_disk_filename_template)
 
-        # Add User-Agent to ydl_opts
-        ydl_opts = {
+        ydl_opts_download = {
+            **common_opts, # Spread common options
             'format': 'bestaudio/best',
             'outtmpl': output_template_audio_abs,
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format}],
-            'noplaylist': True, 'noprogress': True, 'verbose': False, 'logger': app.logger,
-            'socket_timeout': SOCKET_TIMEOUT_SECONDS,
-            'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
+            'quiet': False, # Allow yt-dlp to show its download progress
+            'noprogress': False, # Ensure progress is shown if quiet is False
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
             app.logger.info(f"Starting audio download/extraction for {video_url}...")
             error_code = ydl.download([video_url])
             if error_code != 0:
@@ -135,28 +154,25 @@ def get_youtube_transcript_text(video_url):
     temp_vtt_dir = TRANSCRIPTS_TEMP_DIR
     output_template_transcript_abs = os.path.join(temp_vtt_dir, temp_vtt_basename) 
 
-    # Add User-Agent to ydl_opts
-    ydl_opts = {
+    common_opts = _get_common_ydl_opts()
+    ydl_opts_transcript = {
+        **common_opts, # Spread common options
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': ['ro', 'en'], 
         'subtitlesformat': 'vtt',
         'skip_download': True,      
-        'outtmpl': output_template_transcript_abs, 
-        'noplaylist': True, 
-        'noprogress': True, 
-        'verbose': False, 
-        'logger': app.logger,
-        'socket_timeout': SOCKET_TIMEOUT_SECONDS,
-        'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
+        'outtmpl': output_template_transcript_abs,
+        'quiet': False, # Allow yt-dlp to show its messages
+        'noprogress': False,
     }
 
     downloaded_vtt_path = None
     actual_lang_code = None
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            app.logger.info(f"Starting direct transcript download for {video_url} (langs: ro, en) with timeout {SOCKET_TIMEOUT_SECONDS}s...")
+        with yt_dlp.YoutubeDL(ydl_opts_transcript) as ydl:
+            app.logger.info(f"Starting direct transcript download for {video_url} (langs: ro, en)...")
             info_dict = ydl.extract_info(video_url, download=True) 
             
             requested_subs = info_dict.get('requested_subtitles')
@@ -232,9 +248,6 @@ def api_get_youtube_transcript():
     if not video_url_param:
         app.logger.warning("Missing 'url' parameter in /api/get_youtube_transcript request.")
         return jsonify({"error": "Missing 'url' parameter"}), 400
-    # Removed the specific YouTube URL check to allow yt-dlp to try any URL it supports.
-    # The function name get_youtube_transcript_text still implies YouTube, but yt-dlp might handle others.
-    # For now, let's keep it flexible.
     result = get_youtube_transcript_text(video_url_param)
     status_code = 500 if result.get("error") else 200
     return jsonify(result), status_code
@@ -256,10 +269,9 @@ def health_check():
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
-    # This import is only needed if you run the script directly (python transcriber.py)
-    # and use the timestamped filename logic, which is in extract_audio_from_video.
-    # from datetime import datetime # Already imported at the top level
     app.logger.info("--- Starting Flask app locally (for development) ---")
+    if PROXY_URL_FROM_ENV:
+        app.logger.info(f"Local run would use proxy: {PROXY_URL_FROM_ENV.split('@')[1] if '@' in PROXY_URL_FROM_ENV else 'Proxy configured'}")
     if not is_ffmpeg_available():
         app.logger.critical("CRITICAL: FFmpeg is not installed or not found. This API requires FFmpeg.")
     else:
