@@ -1,11 +1,11 @@
 import yt_dlp
 import os
 import shutil
-import re # Pentru parsarea VTT
+import re # Pentru parsarea VTT și curățarea numelui de fișier
 from flask import Flask, request, jsonify, send_from_directory, url_for, Response # Am adăugat Response
 import logging
 import uuid # Pentru nume de fișiere temporare unice
-from datetime import datetime
+from datetime import datetime # Pentru nume de fișiere cu timestamp
 
 # --- Configurare Aplicație Flask ---
 app = Flask(__name__)
@@ -38,45 +38,67 @@ def is_ffmpeg_available():
     """Verifică dacă FFmpeg este instalat și accesibil."""
     return shutil.which("ffmpeg") is not None
 
-def sanitize_filename(name_str, max_length=60):
+def sanitize_filename(name_str, max_length=60): # Am redus max_length pentru a include timestamp-ul
     """Curăță un string pentru a fi un nume de fișier sigur."""
-    s = name_str.replace(' ', '_')
+    s = name_str.replace(' ', '_') # Înlocuiește spațiile cu underscore întâi
+    # Păstrează doar caractere alfanumerice, underscore, cratimă. Înlocuiește restul cu underscore.
     s = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in s)
-    s = re.sub(r'_+', '_', s) # Elimină underscore-urile consecutive
+    s = re.sub(r'_+', '_', s) # Elimină underscore-urile consecutive care ar fi putut fi create
     s = s.strip('_') # Elimină underscore-urile de la început/sfârșit
     return s[:max_length]
 
 def vtt_to_plaintext(vtt_content):
-    """Convertește conținutul VTT în text simplu."""
-    lines = vtt_content.splitlines()
-    text_lines = []
-    in_dialogue_block = False
-    for line in lines:
+    """
+    Convertește conținutul VTT în text simplu, eliminând duplicatele consecutive.
+    """
+    processed_lines = []
+    for line in vtt_content.splitlines():
         line_stripped = line.strip()
-        if not line_stripped:
-            in_dialogue_block = False
+        # Sare peste antetul WEBVTT, numerele replicilor și timestamp-uri
+        if line_stripped == "WEBVTT" or \
+           "-->" in line_stripped or \
+           (line_stripped.isdigit() and not any(c.isalpha() for c in line_stripped)): # Verifică dacă e format doar din cifre
             continue
-        if "-->" in line_stripped: # Linie de timestamp
-            in_dialogue_block = True
-            continue
-        if line_stripped.isdigit() and not in_dialogue_block: # Numerele replicilor
-            continue
-        if in_dialogue_block:
-            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped) # Elimină tag-urile VTT
+        
+        if line_stripped: # Dacă nu e goală după curățare
+            # Curăță tag-urile VTT (ex: <v Autor>Text</v> sau <i>Text</i>)
+            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped)
+            # Înlocuiește entitățile HTML comune care ar putea apărea
             cleaned_line = cleaned_line.replace(' ', ' ').replace('&', '&').replace('<', '<').replace('>', '>')
-            if cleaned_line:
-                text_lines.append(cleaned_line)
-    return "\n".join(text_lines)
+            processed_lines.append(cleaned_line)
+
+    if not processed_lines:
+        return ""
+
+    # Unește toate liniile procesate, apoi elimină duplicatele consecutive
+    # Acest pas este necesar pentru a prinde duplicatele care ar putea apărea pe linii diferite în VTT
+    # dar devin consecutive după unire și curățare.
+    
+    # full_text = "\n".join(processed_lines) # Nu mai este necesar să unim și apoi să despărțim
+    # lines_for_dedup = full_text.splitlines() # Folosim direct processed_lines
+
+    deduplicated_text_lines = []
+    last_added_line_stripped = None # Vom compara liniile curățate de spații albe
+    for text_line in processed_lines:
+        current_line_stripped = text_line.strip() # Curățăm spațiile pentru comparație
+        if current_line_stripped and current_line_stripped != last_added_line_stripped:
+            deduplicated_text_lines.append(text_line) # Adăugăm linia originală (cu spațierea ei)
+            last_added_line_stripped = current_line_stripped
+        elif not current_line_stripped and last_added_line_stripped is not None: # Gestionează liniile goale după text
+            deduplicated_text_lines.append(text_line) # Păstrăm linia goală dacă era intenționată
+            last_added_line_stripped = None # Resetăm pentru ca următoarea linie ne-goală să nu fie considerată duplicat al unei linii goale
+
+    return "\n".join(deduplicated_text_lines)
 
 def _get_common_ydl_opts():
     """Funcție ajutătoare pentru opțiunile comune yt-dlp, inclusiv proxy."""
     opts = {
         'socket_timeout': SOCKET_TIMEOUT_SECONDS,
         'http_headers': {'User-Agent': COMMON_USER_AGENT},
-        'logger': app.logger, # Direcționează log-urile yt-dlp către logger-ul Flask/Gunicorn
+        'logger': app.logger,
         'noplaylist': True,
-        'noprogress': True, # Bun pentru log-urile API
-        'verbose': False,
+        'noprogress': True, 
+        'verbose': False,   
     }
     if PROXY_URL_FROM_ENV:
         opts['proxy'] = PROXY_URL_FROM_ENV
@@ -94,11 +116,12 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
     try:
         common_opts = _get_common_ydl_opts()
         info_opts = {**common_opts, 'quiet': True, 'extract_flat': 'in_playlist'}
+        
         with yt_dlp.YoutubeDL(info_opts) as ydl_info:
             app.logger.info(f"Se preiau metadatele video pentru audio: {video_url}...")
             info_dict = ydl_info.extract_info(video_url, download=False)
             video_title = info_dict.get('title', f'unknown_video_{uuid.uuid4().hex[:6]}')
-            app.logger.info(f"Titlul video pentru audio: '{video_title}'")
+            app.logger.info(f"Titlul video original pentru audio: '{video_title}'")
 
         current_time_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         sanitized_title_part = sanitize_filename(video_title)
@@ -107,22 +130,24 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
         
         request_folder_name = base_output_filename_safe
         request_download_dir_abs = os.path.join(DOWNLOADS_BASE_DIR, request_folder_name)
+        
         if not os.path.exists(request_download_dir_abs):
             os.makedirs(request_download_dir_abs)
+            app.logger.info(f"Director de descărcare specific cererii creat: {request_download_dir_abs}")
         
-        actual_disk_filename_template = f'{base_output_filename_safe}.%(ext)s'
+        actual_disk_filename_template = f'{base_output_filename_safe}.%(ext)s' # yt-dlp va completa extensia
         output_template_audio_abs = os.path.join(request_download_dir_abs, actual_disk_filename_template)
 
         ydl_opts_download = {
             **common_opts,
             'format': 'bestaudio/best',
-            'outtmpl': output_template_audio_abs,
+            'outtmpl': output_template_audio_abs, # yt-dlp folosește acest șablon
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format}],
-            'quiet': False, # Permite yt-dlp să afișeze progresul descărcării
-            'noprogress': False, # Asigură afișarea progresului
+            'quiet': False, 
+            'noprogress': False, 
         }
         with yt_dlp.YoutubeDL(ydl_opts_download) as ydl:
-            app.logger.info(f"Se începe descărcarea/extragerea audio pentru {video_url}...")
+            app.logger.info(f"Se începe descărcarea/extragerea audio pentru {video_url} către șablonul {output_template_audio_abs}")
             error_code = ydl.download([video_url])
             if error_code != 0:
                 result_paths["error"] = f"Procesul audio yt-dlp a eșuat (cod {error_code})."
@@ -133,7 +158,7 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
         result_paths["audio_relative_path"] = os.path.join(request_folder_name, final_audio_filename_on_disk)
         
         if not os.path.exists(result_paths["audio_server_path"]):
-            result_paths["error"] = "Fișierul audio nu a fost găsit după procesare."
+            result_paths["error"] = f"Fișierul audio nu a fost găsit după procesare la {result_paths['audio_server_path']}. Verifică șablonul de output yt-dlp și conversia FFmpeg."
             result_paths["audio_server_path"] = None
             result_paths["audio_relative_path"] = None
         else:
@@ -149,19 +174,20 @@ def get_youtube_transcript_text(video_url):
     app.logger.info(f"Cerere de transcriere pentru URL YouTube: {video_url}")
     result_data = {"transcript_text": None, "language_detected": None, "error": None}
     
-    temp_vtt_basename = f"transcript_{uuid.uuid4().hex}"
+    temp_vtt_basename = f"transcript_{uuid.uuid4().hex}" # Nume de bază unic pentru fișierul temporar
     temp_vtt_dir = TRANSCRIPTS_TEMP_DIR
+    # yt-dlp va adăuga '.<limba>.vtt' la această cale pentru fișierul efectiv de subtitrare
     output_template_transcript_abs = os.path.join(temp_vtt_dir, temp_vtt_basename) 
 
     common_opts = _get_common_ydl_opts()
     ydl_opts = {
         **common_opts,
         'writesubtitles': True,
-        'writeautomaticsub': True,
+        'writeautomaticsub': True,  # Încearcă să obțină și cele generate automat dacă cele manuale nu sunt găsite
         'subtitleslangs': ['ro', 'en'], # Încearcă Română întâi, apoi Engleză
         'subtitlesformat': 'vtt',
-        'skip_download': True,      
-        'outtmpl': output_template_transcript_abs, 
+        'skip_download': True,      # IMPORTANT: Descarcă doar subtitrările
+        'outtmpl': output_template_transcript_abs, # Calea de bază pentru fișierul de subtitrare
         'quiet': False, 
         'noprogress': False,
     }
@@ -172,28 +198,36 @@ def get_youtube_transcript_text(video_url):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             app.logger.info(f"Se începe descărcarea directă a transcrierii pentru {video_url} (limbi: ro, en) cu timeout {SOCKET_TIMEOUT_SECONDS}s...")
+            # extract_info cu download=True va declanșa descărcarea subtitrării pe baza ydl_opts
             info_dict = ydl.extract_info(video_url, download=True) 
             
+            # După descărcare, determină calea fișierului și limba efectivă
+            # yt-dlp stochează informații despre subtitrările descărcate în 'requested_subtitles'
             requested_subs = info_dict.get('requested_subtitles')
             if requested_subs:
+                # Verifică 'ro' sau 'en' în subtitrările descărcate, în ordinea preferinței
                 for lang_code in ['ro', 'en']: 
                     if lang_code in requested_subs:
                         sub_info = requested_subs[lang_code]
+                        # Verifică dacă cheia 'filepath' există și fișierul există pe disc
                         if sub_info.get('filepath') and os.path.exists(sub_info['filepath']):
                             downloaded_vtt_path = sub_info['filepath']
                             actual_lang_code = lang_code
                             app.logger.info(f"Transcriere descărcată: {downloaded_vtt_path} (Limba: {actual_lang_code})")
-                            break 
+                            break # Am găsit limba preferată
             
+            # Dacă nu a fost găsită prin requested_subtitles (ex: auto-subs se pot comporta diferit sau calea nu e acolo)
+            # Fallback: scanează directorul pentru modelul de fișier așteptat
             if not downloaded_vtt_path:
                 app.logger.info("Calea transcrierii nu este în 'requested_subtitles', se scanează directorul...")
                 for lang in ['ro', 'en']:
+                    # yt-dlp de obicei îl numește <outtmpl>.<limba>.vtt
                     potential_path = os.path.join(temp_vtt_dir, f"{temp_vtt_basename}.{lang}.vtt")
                     if os.path.exists(potential_path):
                         downloaded_vtt_path = potential_path
                         actual_lang_code = lang
                         app.logger.info(f"Transcriere găsită prin scanare: {downloaded_vtt_path} (Limba: {actual_lang_code})")
-                        break
+                        break # Am găsit o transcriere
             
             if not downloaded_vtt_path:
                 result_data["error"] = "Fișierul VTT al transcrierii nu a fost găsit după încercarea de descărcare sau nu este disponibil în RO/EN."
@@ -207,13 +241,14 @@ def get_youtube_transcript_text(video_url):
         result_data["language_detected"] = actual_lang_code
         app.logger.info(f"Transcriere parsată cu succes pentru limba: {actual_lang_code}")
 
-    except yt_dlp.utils.DownloadError as de_yt:
+    except yt_dlp.utils.DownloadError as de_yt: # Prinde erorile specifice de descărcare yt-dlp
         app.logger.error(f"yt-dlp DownloadError în timpul procesării transcrierii pentru {video_url}: {de_yt}")
-        result_data["error"] = f"yt-dlp DownloadError: {str(de_yt)}"
+        result_data["error"] = f"yt-dlp DownloadError: {str(de_yt)}" # Returnează mesajul de eroare yt-dlp
     except Exception as e:
         app.logger.error(f"Eroare în get_youtube_transcript_text pentru {video_url}: {e}", exc_info=True)
         result_data["error"] = f"Eroare neașteptată în timpul procesării transcrierii: {str(e)}"
     finally:
+        # Curăță fișierul VTT temporar
         if downloaded_vtt_path and os.path.exists(downloaded_vtt_path):
             try:
                 os.remove(downloaded_vtt_path)
@@ -251,26 +286,17 @@ def api_get_youtube_transcript():
         app.logger.warning("Parametrul 'url' lipsește din cererea /api/get_youtube_transcript.")
         return jsonify({"error": "Parametrul 'url' lipsește"}), 400
     
-    # Verificare simplă dacă este un URL YouTube (poate fi îmbunătățită)
-    # Am eliminat verificarea strictă pentru a permite yt-dlp să încerce orice URL valid pe care îl suportă pentru subtitrări
-    # if not ("youtube.com/" in video_url_param or "youtu.be/" in video_url_param):
-    #     app.logger.warning(f"URL non-YouTube furnizat pentru transcriere: {video_url_param}")
-    #     return jsonify({"error": "Acest endpoint suportă în principal URL-uri YouTube pentru transcrieri."}), 400
-
     result = get_youtube_transcript_text(video_url_param)
 
-    # --- MODIFICARE PENTRU A RETURNA TEXT SIMPLU ---
     if result.get("error"):
-        # Erorile sunt încă returnate ca JSON pentru a putea fi parsat mesajul de eroare
-        return jsonify({"error": result["error"], "language_detected": None, "transcript_text": None}), 500
+        # Erorile sunt încă returnate ca JSON
+        return jsonify({"error": result["error"], "language_detected": result.get("language_detected"), "transcript_text": None}), 500
     elif result.get("transcript_text") is not None:
         # Returnează textul simplu direct, cu Content-Type text/plain
         return Response(result["transcript_text"], mimetype='text/plain; charset=utf-8')
     else:
-        # Caz neașteptat, ar trebui să existe fie text, fie eroare
         app.logger.error("Rezultat neașteptat de la get_youtube_transcript_text: nici text, nici eroare.")
         return jsonify({"error": "Eroare internă neașteptată la procesarea transcrierii."}), 500
-    # --- SFÂRȘITUL MODIFICĂRII ---
 
 @app.route('/files/<path:relative_file_path>')
 def serve_downloaded_file(relative_file_path):
