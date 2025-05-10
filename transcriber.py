@@ -1,7 +1,7 @@
 import yt_dlp
 import os
 import shutil
-import re # For new sanitize_filename and VTT parsing
+import re # For parsing VTT
 from flask import Flask, request, jsonify, send_from_directory, url_for
 import logging
 import uuid # For unique temporary transcript file names
@@ -13,8 +13,8 @@ app.logger.setLevel(logging.INFO)
 
 # --- Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOADS_BASE_DIR = os.path.join(BASE_DIR, "api_downloads") # For MP3s that will be served
-TRANSCRIPTS_TEMP_DIR = os.path.join(BASE_DIR, "api_transcripts_temp") # For temporary VTT files
+DOWNLOADS_BASE_DIR = os.path.join(BASE_DIR, "api_downloads")
+TRANSCRIPTS_TEMP_DIR = os.path.join(BASE_DIR, "api_transcripts_temp")
 
 if not os.path.exists(DOWNLOADS_BASE_DIR):
     os.makedirs(DOWNLOADS_BASE_DIR)
@@ -25,6 +25,8 @@ if not os.path.exists(TRANSCRIPTS_TEMP_DIR):
 
 # --- Constants ---
 SOCKET_TIMEOUT_SECONDS = 180
+# Common User-Agent string
+COMMON_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 
 def is_ffmpeg_available():
     return shutil.which("ffmpeg") is not None
@@ -52,8 +54,8 @@ def vtt_to_plaintext(vtt_content):
         if line_stripped.isdigit() and not in_dialogue_block:
             continue
         if in_dialogue_block:
-            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped)
-            cleaned_line = cleaned_line.replace(' ', ' ').replace('&', '&').replace('<', '<').replace('>', '>')
+            cleaned_line = re.sub(r'<[^>]+>', '', line_stripped) # Remove VTT tags like <v Author>Text</v> or <i>Text</i>
+            cleaned_line = cleaned_line.replace(' ', ' ').replace('&', '&').replace('<', '<').replace('>', '>') # Handle common HTML entities
             if cleaned_line:
                 text_lines.append(cleaned_line)
     return "\n".join(text_lines)
@@ -67,50 +69,54 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
 
     result_paths = {"audio_server_path": None, "audio_relative_path": None, "error": None}
     try:
-        info_opts = {'quiet': True, 'noplaylist': True, 'extract_flat': 'in_playlist', 'socket_timeout': SOCKET_TIMEOUT_SECONDS}
+        # Add User-Agent to info_opts
+        info_opts = {
+            'quiet': True, 'noplaylist': True, 'extract_flat': 'in_playlist',
+            'socket_timeout': SOCKET_TIMEOUT_SECONDS,
+            'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
+        }
         with yt_dlp.YoutubeDL(info_opts) as ydl_info:
             app.logger.info(f"Fetching video metadata for audio: {video_url}...")
             info_dict = ydl_info.extract_info(video_url, download=False)
             video_title = info_dict.get('title', f'unknown_video_{uuid.uuid4().hex[:6]}')
-            app.logger.info(f"Original video title for audio: '{video_title}'")
+            app.logger.info(f"Video title for audio: '{video_title}'")
 
-        # --- MODIFICATION FOR DATE-PREFIXED FILENAME ---
         current_time_str = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        sanitized_title = sanitize_filename(video_title)
-        base_output_filename_safe = f"{current_time_str}_{sanitized_title}"
-        # --- END OF MODIFICATION ---
+        sanitized_title_part = sanitize_filename(video_title)
+        base_output_filename_safe = f"{current_time_str}_{sanitized_title_part}"
         app.logger.info(f"Timestamped and sanitized base filename: '{base_output_filename_safe}'")
-
-        request_folder_name = base_output_filename_safe # Directory name will be the timestamped and sanitized title
-        request_download_dir_abs = os.path.join(DOWNLOADS_BASE_DIR, request_folder_name)
         
+        request_folder_name = base_output_filename_safe
+        request_download_dir_abs = os.path.join(DOWNLOADS_BASE_DIR, request_folder_name)
         if not os.path.exists(request_download_dir_abs):
             os.makedirs(request_download_dir_abs)
             app.logger.info(f"Created request-specific audio download directory: {request_download_dir_abs}")
-
-        actual_disk_filename_template = f'{base_output_filename_safe}.%(ext)s' # yt-dlp will fill extension
+        
+        actual_disk_filename_template = f'{base_output_filename_safe}.%(ext)s'
         output_template_audio_abs = os.path.join(request_download_dir_abs, actual_disk_filename_template)
 
+        # Add User-Agent to ydl_opts
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': output_template_audio_abs,
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': audio_format}],
             'noplaylist': True, 'noprogress': True, 'verbose': False, 'logger': app.logger,
-            'socket_timeout': SOCKET_TIMEOUT_SECONDS
+            'socket_timeout': SOCKET_TIMEOUT_SECONDS,
+            'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            app.logger.info(f"Starting audio download/extraction for {video_url} to template {output_template_audio_abs}")
+            app.logger.info(f"Starting audio download/extraction for {video_url}...")
             error_code = ydl.download([video_url])
             if error_code != 0:
                 result_paths["error"] = f"yt-dlp audio process failed (code {error_code})."
                 return result_paths
-
+        
         final_audio_filename_on_disk = f"{base_output_filename_safe}.{audio_format}"
         result_paths["audio_server_path"] = os.path.join(request_download_dir_abs, final_audio_filename_on_disk)
         result_paths["audio_relative_path"] = os.path.join(request_folder_name, final_audio_filename_on_disk)
         
         if not os.path.exists(result_paths["audio_server_path"]):
-            result_paths["error"] = f"Audio file not found post-processing at {result_paths['audio_server_path']}. Check yt-dlp output template and FFmpeg conversion."
+            result_paths["error"] = "Audio file not found post-processing."
             result_paths["audio_server_path"] = None
             result_paths["audio_relative_path"] = None
         else:
@@ -129,20 +135,30 @@ def get_youtube_transcript_text(video_url):
     temp_vtt_dir = TRANSCRIPTS_TEMP_DIR
     output_template_transcript_abs = os.path.join(temp_vtt_dir, temp_vtt_basename) 
 
+    # Add User-Agent to ydl_opts
     ydl_opts = {
-        'writesubtitles': True, 'writeautomaticsub': True,
-        'subtitleslangs': ['ro', 'en'],
-        'subtitlesformat': 'vtt', 'skip_download': True,      
+        'writesubtitles': True,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['ro', 'en'], 
+        'subtitlesformat': 'vtt',
+        'skip_download': True,      
         'outtmpl': output_template_transcript_abs, 
-        'noplaylist': True, 'noprogress': True, 'verbose': False, 
-        'logger': app.logger, 'socket_timeout': SOCKET_TIMEOUT_SECONDS 
+        'noplaylist': True, 
+        'noprogress': True, 
+        'verbose': False, 
+        'logger': app.logger,
+        'socket_timeout': SOCKET_TIMEOUT_SECONDS,
+        'http_headers': {'User-Agent': COMMON_USER_AGENT} # Added User-Agent
     }
+
     downloaded_vtt_path = None
     actual_lang_code = None
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             app.logger.info(f"Starting direct transcript download for {video_url} (langs: ro, en) with timeout {SOCKET_TIMEOUT_SECONDS}s...")
             info_dict = ydl.extract_info(video_url, download=True) 
+            
             requested_subs = info_dict.get('requested_subtitles')
             if requested_subs:
                 for lang_code in ['ro', 'en']: 
@@ -153,6 +169,7 @@ def get_youtube_transcript_text(video_url):
                             actual_lang_code = lang_code
                             app.logger.info(f"Transcript downloaded: {downloaded_vtt_path} (Language: {actual_lang_code})")
                             break 
+            
             if not downloaded_vtt_path:
                 app.logger.info("Transcript path not in 'requested_subtitles', scanning directory...")
                 for lang in ['ro', 'en']:
@@ -162,15 +179,19 @@ def get_youtube_transcript_text(video_url):
                         actual_lang_code = lang
                         app.logger.info(f"Transcript found by scanning: {downloaded_vtt_path} (Language: {actual_lang_code})")
                         break
+            
             if not downloaded_vtt_path:
                 result_data["error"] = "Transcript VTT file not found after download attempt or not available in RO/EN."
                 app.logger.warning(result_data["error"])
                 return result_data
+
         with open(downloaded_vtt_path, 'r', encoding='utf-8') as f:
             vtt_content = f.read()
+        
         result_data["transcript_text"] = vtt_to_plaintext(vtt_content)
         result_data["language_detected"] = actual_lang_code
         app.logger.info(f"Transcript parsed successfully for language: {actual_lang_code}")
+
     except yt_dlp.utils.DownloadError as de_yt:
         app.logger.error(f"yt-dlp DownloadError during transcript processing for {video_url}: {de_yt}")
         result_data["error"] = f"yt-dlp DownloadError: {str(de_yt)}"
@@ -211,8 +232,9 @@ def api_get_youtube_transcript():
     if not video_url_param:
         app.logger.warning("Missing 'url' parameter in /api/get_youtube_transcript request.")
         return jsonify({"error": "Missing 'url' parameter"}), 400
-    if not ("youtube.com/" in video_url_param or "youtu.be/" in video_url_param):
-        app.logger.warning(f"Non-YouTube URL provided for transcript: {video_url_param}")
+    # Removed the specific YouTube URL check to allow yt-dlp to try any URL it supports.
+    # The function name get_youtube_transcript_text still implies YouTube, but yt-dlp might handle others.
+    # For now, let's keep it flexible.
     result = get_youtube_transcript_text(video_url_param)
     status_code = 500 if result.get("error") else 200
     return jsonify(result), status_code
@@ -234,6 +256,9 @@ def health_check():
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
+    # This import is only needed if you run the script directly (python transcriber.py)
+    # and use the timestamped filename logic, which is in extract_audio_from_video.
+    # from datetime import datetime # Already imported at the top level
     app.logger.info("--- Starting Flask app locally (for development) ---")
     if not is_ffmpeg_available():
         app.logger.critical("CRITICAL: FFmpeg is not installed or not found. This API requires FFmpeg.")
