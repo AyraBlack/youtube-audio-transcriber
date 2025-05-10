@@ -126,8 +126,7 @@ def extract_audio_from_video(video_url, audio_format="mp3"):
         result_paths["error"] = f"Unexpected error during audio extraction: {str(e)}"
         return result_paths
 
-# --- START OF FUNCTION THAT WAS ALREADY IN YOUR PROVIDED SCRIPT ---
-# (This is the one we worked on to get title, channel, transcript, language for YouTube)
+# --- THIS IS THE FUNCTION YOU PROVIDED IN THE PREVIOUS MESSAGE ---
 def get_youtube_details_and_transcript(video_url):
     app.logger.info(f"Details and transcript requested for YouTube URL: {video_url}")
     result_data = {
@@ -139,10 +138,8 @@ def get_youtube_details_and_transcript(video_url):
     }
     
     temp_vtt_basename = f"transcript_{uuid.uuid4().hex}"
-    # TRANSCRIPTS_TEMP_DIR and SOCKET_TIMEOUT_SECONDS should be defined globally
     output_template_transcript_abs = os.path.join(TRANSCRIPTS_TEMP_DIR, temp_vtt_basename)
 
-    # ydl_opts for subtitles, distinct from the one in extract_audio_from_video
     ydl_opts_subs = { 
         'writesubtitles': True,
         'writeautomaticsub': True,
@@ -162,7 +159,7 @@ def get_youtube_details_and_transcript(video_url):
     try:
         with yt_dlp.YoutubeDL(ydl_opts_subs) as ydl:
             app.logger.info(f"Fetching info and transcript for {video_url} (langs: ro, en)...")
-            info_dict = ydl.extract_info(video_url, download=True) # download=True is needed for subtitles
+            info_dict = ydl.extract_info(video_url, download=True) 
 
             result_data["title"] = info_dict.get('title', 'Unknown Title')
             result_data["channel_name"] = info_dict.get('uploader', info_dict.get('channel', 'Unknown Channel'))
@@ -273,7 +270,8 @@ def api_extract_audio():
              status_code = 500 
     return jsonify(response_data), status_code
 
-# --- THIS IS THE ROUTE THAT WAS ALREADY IN YOUR SCRIPT, NOW WITH CORRECTED URL CHECK ---
+# --- THIS IS THE ROUTE THAT WAS ALREADY IN YOUR SCRIPT ---
+# --- THE ONLY CHANGE IS THE CORRECTED YOUTUBE URL VALIDATION LOGIC ---
 @app.route('/api/get_youtube_details', methods=['GET'])
 def api_get_youtube_details_route(): 
     app.logger.info("Received request for /api/get_youtube_details")
@@ -282,14 +280,12 @@ def api_get_youtube_details_route():
         app.logger.warning("Missing 'url' parameter in /api/get_youtube_details request.")
         return jsonify({"error": "Missing 'url' parameter"}), 400
     
-    # --- START OF CORRECTED YOUTUBE URL CHECK ---
-    # More robust check for YouTube URLs
+    # --- START OF CORRECTED AND SIMPLIFIED YOUTUBE URL CHECK ---
     is_youtube_url = False
-    if video_url_param: # Ensure video_url_param is not None before calling lower()
+    if isinstance(video_url_param, str): # Ensure it's a string before calling .lower()
         lower_video_url = video_url_param.lower()
-        if "https://youtube-audio-transcriber-production.up.railway.app/api/get_youtube_details?url=https://www.https://www.youtube.com/watch?v=QkO7WSQbFbo0" in lower_video_url or \
-           "https://www.youtube.com/watch?v=JIU_H7gXy541" in lower_video_url or \
-           "https://www.youtube.com/watch?v=JIU_H7gXy542" in lower_video_url: # For youtu.be links
+        # More reliable check for YouTube domains
+        if "https://www.youtube.com/watch?v=QkO7WSQbFbo7" in lower_video_url or "https://www.youtube.com/watch?v=JIU_H7gXy545" in lower_video_url:
             is_youtube_url = True
     
     if not is_youtube_url:
@@ -342,4 +338,4 @@ if __name__ == '__main__':
         app.logger.info("FFmpeg found (local check).")
     app.logger.info(f"MP3s will be saved under: {DOWNLOADS_BASE_DIR}")
     app.logger.info(f"Temp transcripts under: {TRANSCRIPTS_TEMP_DIR}")
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    app.run(host='0.0.0.0', port=5001, debug=True) # Assuming port 5001 for local dev
