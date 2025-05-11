@@ -178,7 +178,7 @@ def get_youtube_transcript_text(video_url):
         **common_opts,
         'writesubtitles': True,
         'writeautomaticsub': True,  # Attempt to get auto-generated if manual isn't found for lang
-        'subtitleslangs': ['ro', 'en'], # Try Romanian first, then English
+        'subtitleslangs': ['en', 'ro'], # Try English first, then Romanian
         'subtitlesformat': 'vtt',
         'skip_download': True,      # IMPORTANT: Only download subtitles
         'outtmpl': output_template_transcript_abs, # Base path for subtitle file
@@ -200,7 +200,7 @@ def get_youtube_transcript_text(video_url):
             requested_subs = info_dict.get('requested_subtitles')
             if requested_subs:
                 # Check for 'ro' or 'en' in the downloaded subs, in our preferred order
-                for lang_code in ['ro', 'en']: 
+                for lang_code in ['en', 'ro']: 
                     if lang_code in requested_subs:
                         sub_info = requested_subs[lang_code]
                         # Check if 'filepath' key exists and the file is actually on disk
